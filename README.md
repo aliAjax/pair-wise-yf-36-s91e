@@ -37,6 +37,16 @@ python3 app.py --db ./data.db --port 8302
 
 请求身份通过`X-User-Id`和`X-Role`请求头传入。创建和动作的可执行角色由规则引擎控制。
 
+## 撤回执行（`withdrawal` 的 `execute` 动作）
+
+执行撤回是一次完整处置，不再需要工作人员逐条维护样本：
+
+- 执行前按撤回申请的`participant_id`重新核对批准时记录的每份`sample_ids`样本；混入他人样本、样本已处置（如`destroyed`、`anonymized`）或状态不明（非`stored`/`on_loan`，包括样本已消失）时整批停止，申请和样本均保持原状。
+- 核对通过后在单个数据库事务内原子完成：在库（`stored`）样本销毁（`destroyed`），借出（`on_loan`）样本转入待召回（`pending_recall`）。任何一份样本处置失败，全部回滚，不会只成功一半。
+- 每份样本的数据中都写入`withdrawal_id`、`withdrawal_disposition`（`destroyed`/`pending_recall`）和`withdrawn_at`（即申请的`executed_at`），并分别产生`destroy`/`recall`审计记录；撤回申请的`sample_results`保存逐样本结果。
+- 同一申请重复执行时直接返回已有的执行结果：不重新记`executed_at`、不重复销毁或召回样本、不新增审计记录。
+
+
 ## 测试
 
 ```bash

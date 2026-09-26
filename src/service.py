@@ -41,6 +41,10 @@ class DomainService:
         entity = self.repository.get_entity(entity_id)
         if not entity:
             raise NotFoundError("entity not found: " + entity_id)
+        if entity["kind"] == "withdrawal" and action == "execute":
+            return self._execute_withdrawal(
+                actor, entity, dict(data or {}), expected_version
+            )
         expected = int(expected_version) if expected_version is not None else entity["version"]
         next_status, patch = self.rules.validate_transition(
             actor, entity, action, dict(data or {}), self._lookup
@@ -57,6 +61,24 @@ class DomainService:
             {"patch": patch},
         )
         return updated
+
+    def _execute_withdrawal(self, actor, entity, data, expected_version):
+        # Idempotency: an already executed withdrawal replays the stored
+        # result without recording a new time or touching the samples again.
+        if entity["status"] == "executed":
+            return entity
+        expected = int(expected_version) if expected_version is not None else entity["version"]
+        # Pre-check all approved samples against the participant. The
+        # repository re-verifies everything inside one transaction, so a
+        # failure here or there leaves the withdrawal and every sample
+        # untouched.
+        _, patch = self.rules.validate_transition(
+            actor, entity, "execute", data, self._lookup
+        )
+        executed_at = patch.get("executed_at", data.get("executed_at"))
+        return self.repository.execute_withdrawal(
+            entity["id"], expected, actor, executed_at
+        )
 
     def get(self, entity_id):
         entity = self.repository.get_entity(entity_id)

@@ -2,7 +2,7 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 
-from .domain import ConflictError, NotFoundError
+from .domain import ConflictError, NotFoundError, ValidationError
 
 
 def utcnow():
@@ -139,6 +139,162 @@ class SQLiteRepository:
         finally:
             connection.close()
         return self.get_entity(entity_id)
+
+    def execute_withdrawal(self, withdrawal_id, expected_version, actor, executed_at):
+        """Atomically execute an approved withdrawal.
+
+        Every approved sample is re-verified inside one transaction:
+        stored samples are destroyed, on-loan samples move to pending_recall.
+        Each sample keeps its own disposition result and the withdrawal time.
+        Any mismatch rolls the whole batch back.
+        Returns the updated withdrawal entity.
+        """
+        now = utcnow()
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM entities WHERE id = ?", (withdrawal_id,)
+            ).fetchone()
+            if not row:
+                raise NotFoundError("entity not found: " + withdrawal_id)
+            withdrawal = self._entity_from_row(row)
+            if expected_version is not None and withdrawal["version"] != int(expected_version):
+                raise ConflictError(
+                    "version conflict: expected %s, found %s"
+                    % (expected_version, withdrawal["version"])
+                )
+            if withdrawal["kind"] != "withdrawal":
+                raise ValidationError("entity is not a withdrawal: " + withdrawal_id)
+            if withdrawal["status"] != "approved":
+                raise ValidationError(
+                    "withdrawal cannot be executed from status %s" % withdrawal["status"]
+                )
+
+            participant_id = withdrawal["data"].get("participant_id")
+            sample_ids = withdrawal["data"].get("sample_ids") or []
+            if not sample_ids:
+                raise ValidationError("withdrawal has no approved samples")
+
+            sample_rows = {}
+            for sample_id in sample_ids:
+                sample_row = connection.execute(
+                    "SELECT * FROM entities WHERE id = ?", (sample_id,)
+                ).fetchone()
+                if not sample_row:
+                    raise ValidationError("unknown sample: " + str(sample_id))
+                sample = self._entity_from_row(sample_row)
+                if sample["kind"] != "sample":
+                    raise ValidationError("approved item is not a sample: " + str(sample_id))
+                if sample["data"].get("participant_id") != participant_id:
+                    raise ValidationError(
+                        "sample belongs to another participant: " + str(sample_id)
+                    )
+                if sample["status"] not in ("stored", "on_loan"):
+                    raise ValidationError(
+                        "sample %s is not eligible for withdrawal execution (status=%s)"
+                        % (sample_id, sample["status"])
+                    )
+                sample_rows[sample_id] = sample_row
+
+            results = []
+            for sample_id in sample_ids:
+                sample_row = sample_rows[sample_id]
+                sample = self._entity_from_row(sample_row)
+                if sample["status"] == "on_loan":
+                    action = "recall"
+                    next_status = "pending_recall"
+                    disposition = "pending_recall"
+                else:
+                    action = "destroy"
+                    next_status = "destroyed"
+                    disposition = "destroyed"
+                sample_data = dict(sample["data"])
+                sample_data["withdrawal_id"] = withdrawal_id
+                sample_data["withdrawal_disposition"] = disposition
+                sample_data["withdrawn_at"] = executed_at
+                connection.execute(
+                    "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
+                    "WHERE id = ? AND version = ?",
+                    (
+                        next_status,
+                        json.dumps(sample_data, ensure_ascii=False, sort_keys=True),
+                        now,
+                        sample_id,
+                        sample_row["version"],
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO audit_log(entity_id, actor_id, actor_role, action, from_status, to_status, detail, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        sample_id,
+                        actor.user_id,
+                        actor.role,
+                        action,
+                        sample_row["status"],
+                        next_status,
+                        json.dumps(
+                            {
+                                "disposition": disposition,
+                                "executed_at": executed_at,
+                                "withdrawal_id": withdrawal_id,
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                        now,
+                    ),
+                )
+                results.append(
+                    {
+                        "sample_id": sample_id,
+                        "from_status": sample_row["status"],
+                        "to_status": next_status,
+                        "disposition": disposition,
+                    }
+                )
+
+            withdrawal_data = dict(withdrawal["data"])
+            withdrawal_data["executed_at"] = executed_at
+            withdrawal_data["executed_by"] = actor.user_id
+            withdrawal_data["sample_results"] = results
+            connection.execute(
+                "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
+                "WHERE id = ? AND version = ?",
+                (
+                    "executed",
+                    json.dumps(withdrawal_data, ensure_ascii=False, sort_keys=True),
+                    now,
+                    withdrawal_id,
+                    withdrawal["version"],
+                ),
+            )
+            connection.execute(
+                "INSERT INTO audit_log(entity_id, actor_id, actor_role, action, from_status, to_status, detail, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    withdrawal_id,
+                    actor.user_id,
+                    actor.role,
+                    "execute",
+                    "approved",
+                    "executed",
+                    json.dumps(
+                        {"executed_at": executed_at, "results": results},
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    now,
+                ),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return self.get_entity(withdrawal_id)
 
     def append_audit(self, entity_id, actor_id, actor_role, action, from_status, to_status, detail):
         with self._connect() as connection:
