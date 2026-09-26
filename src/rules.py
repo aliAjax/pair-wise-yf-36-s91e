@@ -40,14 +40,43 @@ def _validate_withdrawal_approve(actor, entity, data, lookup):
     return {"approved_by": actor.user_id}
 
 
+# 执行撤回时样本当前状态对应的处置结果。
+# 在库样本销毁，借出样本转入待召回；其余状态（已处置或状态不明）一律拒绝。
+WITHDRAWAL_DISPOSAL = {'stored': 'destroyed', 'on_loan': 'pending_recall'}
+
+
+def _validate_withdrawal_execute(actor, entity, data, lookup):
+    participant_id = entity["data"].get("participant_id")
+    sample_ids = entity["data"].get("sample_ids") or []
+    for sample_id in sample_ids:
+        sample = _find_one(lookup, "sample", "id", sample_id)
+        if not sample:
+            raise ValidationError("unknown sample: " + str(sample_id))
+        if sample["data"].get("participant_id") != participant_id:
+            raise ValidationError(
+                "sample %s does not belong to participant %s"
+                % (sample_id, participant_id)
+            )
+        if sample["status"] not in WITHDRAWAL_DISPOSAL:
+            raise ValidationError(
+                "sample %s cannot be disposed from status %s"
+                % (sample_id, sample["status"])
+            )
+    return {"executed_by": actor.user_id}
+
+
 CUSTOM_CREATE = {'participant': _validate_participant, 'consent': _validate_consent}
-CUSTOM_TRANSITIONS = {('sample', 'store'): _validate_sample_store, ('withdrawal', 'approve'): _validate_withdrawal_approve}
+CUSTOM_TRANSITIONS = {
+    ('sample', 'store'): _validate_sample_store,
+    ('withdrawal', 'approve'): _validate_withdrawal_approve,
+    ('withdrawal', 'execute'): _validate_withdrawal_execute,
+}
 
 
 class RuleEngine:
     ALIASES = {'participants': 'participant', 'consents': 'consent', 'samples': 'sample', 'withdrawals': 'withdrawal'}
     INITIAL_STATUS = {'participant': 'registered', 'consent': 'draft', 'sample': 'collected', 'withdrawal': 'requested'}
-    TRANSITIONS = {'participant': {'close_participant': (('registered',), 'closed')}, 'consent': {'activate': (('draft',), 'active'), 'supersede': (('active',), 'superseded'), 'withdraw': (('active',), 'withdrawn')}, 'sample': {'store': (('collected',), 'stored'), 'loan': (('stored',), 'on_loan'), 'return': (('on_loan',), 'stored'), 'anonymize': (('stored',), 'anonymized'), 'destroy': (('stored',), 'destroyed')}, 'withdrawal': {'approve': (('requested',), 'approved'), 'execute': (('approved',), 'executed')}}
+    TRANSITIONS = {'participant': {'close_participant': (('registered',), 'closed')}, 'consent': {'activate': (('draft',), 'active'), 'supersede': (('active',), 'superseded'), 'withdraw': (('active',), 'withdrawn')}, 'sample': {'store': (('collected',), 'stored'), 'loan': (('stored',), 'on_loan'), 'return': (('on_loan', 'pending_recall'), 'stored'), 'anonymize': (('stored',), 'anonymized'), 'destroy': (('stored',), 'destroyed')}, 'withdrawal': {'approve': (('requested',), 'approved'), 'execute': (('approved',), 'executed')}}
     CREATE_REQUIRED = {'participant': ('name',), 'consent': ('participant_id', 'scope'), 'sample': ('participant_id', 'sample_code', 'collected_at'), 'withdrawal': ('participant_id', 'requested_at')}
     ACTION_REQUIRED = {('consent', 'activate'): ('scope', 'version', 'expires_at'), ('consent', 'supersede'): ('reason',), ('consent', 'withdraw'): ('reason',), ('sample', 'store'): ('freezer', 'position', 'consent_id'), ('sample', 'loan'): ('recipient', 'purpose', 'due_at'), ('sample', 'anonymize'): ('reason',), ('sample', 'destroy'): ('reason',), ('withdrawal', 'approve'): ('reason', 'sample_ids'), ('withdrawal', 'execute'): ('executed_at',)}
     CREATE_ROLES = {'participant': ('admin', 'biobank'), 'consent': ('admin', 'committee'), 'sample': ('admin', 'biobank'), 'withdrawal': ('admin', 'biobank')}
